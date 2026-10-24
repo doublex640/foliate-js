@@ -4175,8 +4175,18 @@ export class Paginator extends HTMLElement {
     #scrollPrev(distance) {
         if (this.#views.size === 0) return true
         if (this.scrolled) {
-            if (this.#renderedStart > 0) return this.#scrollTo(
-                Math.max(0, this.#renderedStart - (distance ?? this.size)), null, true)
+            // A nonzero start offset is not always scrollable away: an RTL
+            // scroller clamps at its own origin, so the requested offset comes
+            // back as the one we were already on. Rewinding then "succeeds"
+            // while the page does not move, and the turn is swallowed right at
+            // the section boundary. Report back whether we actually moved so
+            // #turnPage can cross into the previous section instead.
+            if (this.#renderedStart > 0) {
+                const start = this.#renderedStart
+                return this.#scrollTo(
+                    Math.max(0, start - (distance ?? this.size)), null, true)
+                    .then(() => this.#renderedStart >= start - 1 && !this.atStart)
+            }
             return !this.atStart
         }
         if (this.atStart) return
