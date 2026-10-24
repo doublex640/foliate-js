@@ -639,6 +639,40 @@ export const getDirection = doc => {
 export const getPageProgressionRTL = (bookDir, documentRTL) =>
     bookDir === 'rtl' ? true : bookDir === 'ltr' ? false : documentRTL
 
+// Wheel ticks per line/page for engines that report deltaMode 1/2 instead of
+// pixels, matching the normalisation readest applies in paginated mode.
+const WHEEL_LINE_HEIGHT = 40
+const WHEEL_PAGE_HEIGHT = 800
+
+// Translate a wheel tick into a horizontal scroll delta for a *vertical*
+// (vertical-rl / vertical-lr) book in scrolled mode. There the strip runs along
+// the block axis, so the container only ever overflows horizontally — and no
+// engine folds a vertical delta onto the horizontal axis (Blink ignores the
+// tick outright on a box with no vertical scroll range; touch panning works
+// only because a drag carries both axes). Without this the book does not move
+// at all under a mouse wheel.
+//
+// Returns the signed delta to add to the container's `scrollLeft`, or null when
+// the tick belongs to native scrolling instead: horizontal writing, paginated
+// mode, pinch zoom (ctrl+wheel), or a horizontal-dominant trackpad pan, which
+// the browser already maps onto the axis by itself — translating that one too
+// would move the book twice as far per gesture.
+//
+// The sign follows the container's own `direction`, because that is what
+// decides the sign of `scrollLeft`: a `dir="rtl"` strip starts at 0 and reads
+// forward into negative offsets, so a wheel-down must subtract.
+export const computeVerticalScrollWheelDelta = ({
+    deltaX = 0, deltaY = 0, deltaMode = 0, ctrlKey = false,
+    vertical = false, scrolled = false, rtl = false,
+}) => {
+    if (!scrolled || !vertical || ctrlKey) return null
+    if (Math.abs(deltaY) <= Math.abs(deltaX)) return null
+    const scale = deltaMode === 1 ? WHEEL_LINE_HEIGHT
+        : deltaMode === 2 ? WHEEL_PAGE_HEIGHT : 1
+    const delta = deltaY * scale
+    return rtl ? -delta : delta
+}
+
 const getBackground = doc => {
     // Same blank/detached-document guard as getDirection (READEST-2X).
     if (!doc.defaultView || !doc.body) return ''
@@ -1845,11 +1879,20 @@ export class Paginator extends HTMLElement {
         this.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
         this.addEventListener('touchend', this.#onTouchEnd.bind(this))
         this.addEventListener('touchcancel', this.#onTouchCancel.bind(this))
+        // A wheel over the strip scrolls nothing by itself (see
+        // computeVerticalScrollWheelDelta), so a vertical book in scrolled mode
+        // needs the same pair of listeners the touch path uses: one on the
+        // host, for the margins around the content, and one per section
+        // document, because an event dispatched inside an iframe never reaches
+        // a listener in the host realm. The host side is non-passive so the
+        // untranslated tick cannot also chain into the page around the reader.
+        this.addEventListener('wheel', this.#onWheel, opts)
         this.addEventListener('load', ({ detail: { doc } }) => {
             doc.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
             doc.addEventListener('touchmove', this.#onTouchMove.bind(this), opts)
             doc.addEventListener('touchend', this.#onTouchEnd.bind(this))
             doc.addEventListener('touchcancel', this.#onTouchCancel.bind(this))
+            doc.addEventListener('wheel', this.#onWheel, { passive: true })
         })
 
         this.addEventListener('relocate', ({ detail }) => {
@@ -2669,6 +2712,36 @@ export class Paginator extends HTMLElement {
             return doGoTo()
         }
         this.#scrollToPage(page, 'snap')
+    }
+
+    // A wheel tick over a vertical book in scrolled mode drives the strip
+    // itself. Nothing else can (no engine maps a vertical delta onto a
+    // horizontal-only overflow) and nothing else would, so this is the mouse
+    // counterpart of the native pan the touch path leaves alone. Writing the
+    // offset rather than calling `scrollBy` keeps the tick out of the
+    // paginated swipe bookkeeping; the resulting `scroll` event still runs
+    // relocate, progress saving and adjacent-section preloading exactly as a
+    // drag or trackpad pan does.
+    #onWheel = e => {
+        const delta = computeVerticalScrollWheelDelta({
+            deltaX: e.deltaX,
+            deltaY: e.deltaY,
+            deltaMode: e.deltaMode,
+            ctrlKey: e.ctrlKey,
+            vertical: this.#vertical,
+            scrolled: this.scrolled,
+            // The container's own `direction` is what signs `scrollLeft`, and
+            // the scrolled layout gives a vertical book `rtl` in either writing
+            // mode, so read it back instead of re-deriving it.
+            rtl: this.getAttribute('dir') === 'rtl',
+        })
+        if (delta == null || this.#scrollLocked) return
+        // An overlay that claimed this tick (a zoomed image, a popup) has
+        // already decided what it means; scrolling the book as well would
+        // move the page out from under it.
+        if (e.defaultPrevented) return
+        if (e.cancelable) e.preventDefault()
+        this.#container.scrollLeft += delta
     }
     #onTouchStart(e) {
         const previousState = this.#touchState
